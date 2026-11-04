@@ -1980,99 +1980,75 @@ function getPath(o,p){return p.split('.').reduce((a,k)=>a==null?a:a[k],o)}
 function setPath(o,p,v){const ks=p.split('.');let a=o;for(let i=0;i<ks.length-1;i++){a=a[ks[i]]}a[ks[ks.length-1]]=v}
 
 /* ============================================================
-   STORAGE (claude.ai account when available, else this browser)
+   SUPABASE AUTH + DOCUMENT STORAGE; existing IndexedDB is retained.
+   Configure the public publishable key in the sign-in panel.
    ============================================================ */
-const Store={mode:'local',db:null,uid:null,assets:null,downloads:null,mem:null};
-const IDB={
-  d:null,
+const SUPA_URL='https://bjeacclhymdvpdtivbil.supabase.co';
+const SUPA_BUCKET='trade-journal-images';
+const Store={mode:'local',uid:null,mem:null,downloads:null,session:null,authError:'',cloudError:'',
+  get key(){return localStorage.getItem('tj_supabase_publishable_key')||'sb_publishable_Ei6lHpiztJ8mfiIkZVi-uA_8HkwOqDE'}};
+const IDB={d:null,
   open(){return new Promise((res,rej)=>{try{const r=indexedDB.open('trade-journal',1);r.onupgradeneeded=()=>{const d=r.result;d.createObjectStore('kv');d.createObjectStore('trades',{keyPath:'id'});d.createObjectStore('images')};r.onsuccess=()=>{this.d=r.result;res()};r.onerror=()=>rej(r.error)}catch(e){rej(e)}})},
   req(store,mode,fn){return new Promise((res,rej)=>{const tx=this.d.transaction(store,mode);const rq=fn(tx.objectStore(store));tx.oncomplete=()=>res(rq?rq.result:undefined);tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error)})}
 };
-async function initBackends(){
-  if(window.claude&&typeof window.claude.use==='function'){
-    const get=n=>window.claude.use(n).catch(()=>null);
-    const [db,user,assets,downloads]=await Promise.all([get('db'),get('user'),get('assets'),get('downloads')]);
-    Store.downloads=downloads;
-    if(db&&user){try{const id=await user.id();if(id){Store.db=db;Store.uid=id;Store.mode='cloud'}}catch(e){}}
-    if(assets&&Store.mode==='cloud')Store.assets=assets;
-  }
-  try{await IDB.open()}catch(e){Store.mem={trades:new Map(),images:new Map(),kv:new Map()}}
+function cloudFailure(e){Store.cloudError=e.message||String(e);console.error('Supabase sync error',e);showSyncStatus();toast('Cloud sync failed — '+Store.cloudError);return e}
+async function initBackends(){try{await IDB.open()}catch(e){Store.mem={trades:new Map(),images:new Map(),kv:new Map()}};
+  try{const saved=JSON.parse(localStorage.getItem('tj_supabase_session')||'null');if(saved&&Store.key){Store.session=saved;await refreshAuthIfNeeded();Store.uid=Store.session.user.id;Store.mode='cloud'}}catch(e){Store.authError='Session expired. Sign in again.';Store.session=null;Store.mode='local';localStorage.removeItem('tj_supabase_session')}
 }
-const userCol=()=>Store.db.collection('data/users/'+Store.uid);
-async function loadAll(){
-  let trades=[],settings=null,tdraft=null;
-  if(Store.mode==='cloud'){
-    try{
-      const snap=await userCol().get();
-      snap.docs.forEach(d=>{const v=d.data();if(!v)return;if(d.id==='settings')settings=clone(v);else if(d.id==='tdraft')tdraft=clone(v);else if(['trade','plan','day','page','expense'].includes(v.kind))trades.push(clone(v))});
-    }catch(e){toast('Could not load from your account, using this browser instead');Store.mode='local';Store.db=null;Store.assets=null;return loadAll()}
-  }else if(Store.mem){trades=[...Store.mem.trades.values()].map(clone);settings=Store.mem.kv.get('settings')||null;tdraft=Store.mem.kv.get('tdraft')||null}
-  else{trades=await IDB.req('trades','readonly',s=>s.getAll());settings=await IDB.req('kv','readonly',s=>s.get('settings'))||null;tdraft=await IDB.req('kv','readonly',s=>s.get('tdraft'))||null}
-  return {trades,settings,tdraft};
-}
-async function saveTradeDoc(t){
-  const body=clone(t);
-  if(Store.mode==='cloud')return userCol().doc('t_'+t.id).set(body);
-  if(Store.mem){Store.mem.trades.set(t.id,body);return}
-  return IDB.req('trades','readwrite',s=>s.put(body));
-}
-async function savePageDoc(pg){const body=clone(pg);if(Store.mode==='cloud')return userCol().doc('n_'+pg.id).set(body);if(Store.mem){Store.mem.trades.set(pg.id,body);return}return IDB.req('trades','readwrite',s=>s.put(body))}
-async function saveExpDoc(x){const body=clone(x);if(Store.mode==='cloud')return userCol().doc('x_'+x.id).set(body);if(Store.mem){Store.mem.trades.set(x.id,body);return}return IDB.req('trades','readwrite',s=>s.put(body))}
-async function deleteExpDoc(x){if(Store.mode==='cloud')return userCol().doc('x_'+x.id).delete();if(Store.mem){Store.mem.trades.delete(x.id);return}return IDB.req('trades','readwrite',s=>s.delete(x.id))}
-async function deletePageDoc(pg){if(Store.mode==='cloud')return userCol().doc('n_'+pg.id).delete();if(Store.mem){Store.mem.trades.delete(pg.id);return}return IDB.req('trades','readwrite',s=>s.delete(pg.id))}
-async function deleteTradeDoc(t){
-  if(Store.mode==='cloud')return userCol().doc('t_'+t.id).delete();
-  if(Store.mem){Store.mem.trades.delete(t.id);return}
-  return IDB.req('trades','readwrite',s=>s.delete(t.id));
-}
-async function saveSettings(){
-  if(S.loadFailed)return;
-  const body=clone(S.settings);
-  if(Store.mode==='cloud')return userCol().doc('settings').set(body);
-  if(Store.mem){Store.mem.kv.set('settings',body);return}
-  return IDB.req('kv','readwrite',s=>s.put(body,'settings'));
-}
-/* images */
+async function refreshAuthIfNeeded(){if(!Store.session)throw Error('Sign in required');if(Date.now()<((Store.session.expires_at||0)*1000-60000))return;
+  const r=await fetch(SUPA_URL+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{'apikey':Store.key,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:Store.session.refresh_token})});const j=await r.json();if(!r.ok)throw Error(j.msg||j.error_description||j.message||'Session refresh failed');setSession(j)}
+function setSession(j){Store.session={...j,expires_at:j.expires_at||Math.floor(Date.now()/1000)+j.expires_in};Store.uid=j.user.id;Store.mode='cloud';Store.cloudError='';localStorage.setItem('tj_supabase_session',JSON.stringify(Store.session))}
+async function sbRequest(path,{method='GET',body,headers={},raw=false}={}){if(typeof S!=='undefined'&&S.loadFailed&&method!=='GET')throw Error('Cloud loading failed; writes are blocked to protect your data');if(!Store.key)throw Error('Supabase publishable key is required');await refreshAuthIfNeeded();
+  const h={'apikey':Store.key,'Authorization':'Bearer '+Store.session.access_token,...headers};if(body!=null&&!(body instanceof Blob))h['Content-Type']='application/json';
+  let response;try{response=await fetch(SUPA_URL+path,{method,headers:h,body:body==null?undefined:body instanceof Blob?body:JSON.stringify(body)})}catch(e){throw cloudFailure(Error('Network unavailable; cloud data has NOT been replaced with local data'))}
+  if(!response.ok){const msg=await response.text();throw cloudFailure(Error('Supabase '+response.status+': '+msg.slice(0,350)))}
+  if(raw)return response;const text=await response.text();return text?JSON.parse(text):null}
+const docId=(id)=>encodeURIComponent(id);
+const userCol=()=>({
+  get:async()=>{let all=[],offset=0;while(true){const rows=await sbRequest('/rest/v1/trades?select=id,data&user_id=eq.'+encodeURIComponent(Store.uid)+'&order=id&limit=1000&offset='+offset);all.push(...rows);if(rows.length<1000)break;offset+=1000}return {docs:all.map(r=>({id:r.id,data:()=>r.data}))}},
+  doc:id=>({set:val=>sbRequest('/rest/v1/trades?on_conflict=user_id,id',{method:'POST',headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},body:{user_id:Store.uid,id,data:val}}),
+    delete:()=>sbRequest('/rest/v1/trades?user_id=eq.'+encodeURIComponent(Store.uid)+'&id=eq.'+docId(id),{method:'DELETE'})})
+});
+async function localRecords(){if(Store.mem)return {trades:[...Store.mem.trades.values()].map(clone),settings:Store.mem.kv.get('settings')||null,tdraft:Store.mem.kv.get('tdraft')||null};return {trades:await IDB.req('trades','readonly',s=>s.getAll()),settings:await IDB.req('kv','readonly',s=>s.get('settings'))||null,tdraft:await IDB.req('kv','readonly',s=>s.get('tdraft'))||null}}
+async function loadAll(){if(Store.mode!=='cloud')return localRecords();const snap=await userCol().get();let trades=[],settings=null,tdraft=null;
+  for(const d of snap.docs){const v=d.data();if(!v)continue;if(d.id==='settings')settings=clone(v);else if(d.id==='tdraft')tdraft=clone(v);else if(['trade','plan','day','page','expense'].includes(v.kind))trades.push(clone(v))}return {trades,settings,tdraft}}
+async function saveDoc(prefix,v){const body=clone(v);if(Store.mode==='cloud')return userCol().doc(prefix+v.id).set(body);if(Store.mem){Store.mem.trades.set(v.id,body);return}return IDB.req('trades','readwrite',s=>s.put(body))}
+async function deleteDoc(prefix,v){if(Store.mode==='cloud')return userCol().doc(prefix+v.id).delete();if(Store.mem){Store.mem.trades.delete(v.id);return}return IDB.req('trades','readwrite',s=>s.delete(v.id))}
+const saveTradeDoc=t=>saveDoc('t_',t),savePageDoc=p=>saveDoc('n_',p),saveExpDoc=x=>saveDoc('x_',x),deleteExpDoc=x=>deleteDoc('x_',x),deletePageDoc=p=>deleteDoc('n_',p),deleteTradeDoc=t=>deleteDoc('t_',t);
+async function writeKv(key,val){if(Store.mode==='cloud'){const ref=userCol().doc(key);return val==null?ref.delete():ref.set(val)}if(Store.mem){val==null?Store.mem.kv.delete(key):Store.mem.kv.set(key,val);return}return IDB.req('kv','readwrite',s=>val==null?s.delete(key):s.put(val,key))}
+async function saveSettings(){if(S.loadFailed)return;return writeKv('settings',clone(S.settings))}
 const OK_TYPES=['image/png','image/jpeg','image/webp','image/gif'];
-async function putImage(blob){
-  if(Store.assets){
-    try{const r=await Store.assets.upload(blob,{type:blob.type});return 'a:'+r.id}catch(e){}
-  }
-  const id=uid();
-  if(Store.mem){Store.mem.images.set(id,blob);return 'l:'+id}
-  await IDB.req('images','readwrite',s=>s.put(blob,id));
-  return 'l:'+id;
-}
+async function putImage(blob){if(Store.mode==='cloud'){const ext={'image/png':'png','image/jpeg':'jpg','image/webp':'webp','image/gif':'gif'}[blob.type]||'bin';const path=Store.uid+'/'+uid()+'.'+ext;
+  await sbRequest('/storage/v1/object/'+SUPA_BUCKET+'/'+path,{method:'POST',body:blob,headers:{'Content-Type':blob.type||'application/octet-stream','x-upsert':'false'}});return 's:'+path}
+  const id=uid();if(Store.mem){Store.mem.images.set(id,blob);return 'l:'+id}await IDB.req('images','readwrite',s=>s.put(blob,id));return 'l:'+id}
 const urlCache={};
-async function imgUrl(ref){
-  if(urlCache[ref])return urlCache[ref];
-  if(ref.startsWith('a:'))return urlCache[ref]='/_blob/'+ref.slice(2);
-  const b=await imgBlobLocal(ref.slice(2));
-  return urlCache[ref]=b?URL.createObjectURL(b):'';
-}
 async function imgBlobLocal(id){if(Store.mem)return Store.mem.images.get(id)||null;try{return await IDB.req('images','readonly',s=>s.get(id))||null}catch(e){return null}}
-async function imgBlob(ref){
-  if(ref.startsWith('a:')){try{const r=await fetch('/_blob/'+ref.slice(2));return r.ok?await r.blob():null}catch(e){return null}}
-  return imgBlobLocal(ref.slice(2));
+async function imgBlob(ref){if(!ref)return null;if(ref.startsWith('s:')){if(Store.mode!=='cloud')throw Error('Sign in to load synced chart images');const path=ref.slice(2);if(!path.startsWith(Store.uid+'/'))throw Error('Image belongs to another user');const r=await sbRequest('/storage/v1/object/authenticated/'+SUPA_BUCKET+'/'+path,{raw:true});return r.blob()}
+  if(ref.startsWith('a:'))throw Error('Legacy Claude image needs manual backup/import');return imgBlobLocal(ref.slice(2))}
+async function imgUrl(ref){if(urlCache[ref])return urlCache[ref];try{const b=await imgBlob(ref);return urlCache[ref]=b?URL.createObjectURL(b):''}catch(e){console.error('Chart image could not load',e);return ''}}
+async function delImage(ref){if(!ref)return;if(ref.startsWith('s:')){const path=ref.slice(2);if(Store.mode!=='cloud'||!path.startsWith(Store.uid+'/'))throw Error('Not authorized to delete image');await sbRequest('/storage/v1/object/'+SUPA_BUCKET,{method:'DELETE',body:{prefixes:[path]}})}
+  else if(ref.startsWith('l:')){if(Store.mem)Store.mem.images.delete(ref.slice(2));else await IDB.req('images','readwrite',s=>s.delete(ref.slice(2)))}
+  if(urlCache[ref]&&urlCache[ref].startsWith('blob:'))URL.revokeObjectURL(urlCache[ref]);delete urlCache[ref]}
+function hydrateImages(){document.querySelectorAll('img[data-ref]').forEach(async el=>{const ref=el.dataset.ref;if(urlCache[ref]){el.src=urlCache[ref];return}el.style.opacity='0';el.style.transition='opacity .18s';const u=await imgUrl(ref);if(el.dataset.ref===ref&&u){el.onload=()=>el.style.opacity='1';el.src=u}})}
+async function migrateLocal(){if(Store.mode!=='cloud')return;const local=await localRecords();const n=local.trades.length;const images=await IDB.req('images','readonly',s=>s.getAllKeys()).catch(()=>[]);
+  if(!confirm('Upload '+n+' local records, local settings/draft and up to '+images.length+' local chart images to '+Store.session.user.email+'? Existing cloud records with matching IDs will be overwritten. Local IndexedDB data will NOT be deleted.'))return;
+  const existing=await userCol().get();if(existing.docs.length&&!confirm('Cloud already has '+existing.docs.length+' documents. Continue and overwrite matching IDs?'))return;
+  const mapped=new Map();async function rewrite(v){if(!v||typeof v!=='object')return;if(Array.isArray(v)){for(const x of v)await rewrite(x);return}for(const k of Object.keys(v)){if(k==='ref'&&typeof v[k]==='string'&&v[k].startsWith('l:')){const old=v[k];if(!mapped.has(old)){const blob=await imgBlobLocal(old.slice(2));if(!blob)throw Error('Missing local image '+old);mapped.set(old,await putImage(blob))}v[k]=mapped.get(old)}else await rewrite(v[k])}}
+  try{for(const record of local.trades){const v=clone(record);await rewrite(v);const prefix={trade:'t_',plan:'p_',day:'d_',page:'n_',expense:'x_'}[v.kind];if(prefix)await userCol().doc(prefix+(v.kind==='day'?v.date:v.id)).set(v)}
+    if(local.settings)await userCol().doc('settings').set(local.settings);if(local.tdraft){const d=clone(local.tdraft);await rewrite(d);await userCol().doc('tdraft').set(d)}toast('Local data uploaded. Reloading cloud journal…');location.reload()
+  }catch(e){cloudFailure(e);alert('Migration interrupted. Local data is intact. Some cloud records may already be uploaded; retry after resolving the error.')}
 }
-async function delImage(ref){
-  try{
-    if(ref.startsWith('a:')){if(Store.assets)await Store.assets.delete(ref.slice(2))}
-    else if(Store.mem)Store.mem.images.delete(ref.slice(2));
-    else await IDB.req('images','readwrite',s=>s.delete(ref.slice(2)));
-  }catch(e){}
-  if(urlCache[ref]&&urlCache[ref].startsWith('blob:'))URL.revokeObjectURL(urlCache[ref]);
-  delete urlCache[ref];
-}
-function hydrateImages(){
-  document.querySelectorAll('img[data-ref]').forEach(async el=>{
-    const ref=el.dataset.ref;
-    if(urlCache[ref]){el.src=urlCache[ref];return}
-    el.style.opacity='0';el.style.transition='opacity .18s';
-    const u=await imgUrl(ref);
-    if(el.dataset.ref===ref&&u){el.onload=()=>{el.style.opacity='1'};el.src=u}
-  });
-}
+function showSyncStatus(){let bar=document.getElementById('tj-sync-bar');if(!bar){bar=document.createElement('div');bar.id='tj-sync-bar';bar.style.cssText='position:fixed;right:12px;bottom:12px;z-index:99999;background:#182332;color:white;padding:10px 12px;border:1px solid #748397;border-radius:10px;max-width:340px;font:13px system-ui;box-shadow:0 4px 24px #0005';document.body.appendChild(bar)}
+  bar.innerHTML='<div style="margin-bottom:7px">'+(Store.mode==='cloud'?'☁ Synced account: '+esc(Store.session.user.email):'◯ Local browser data · not synced')+'</div>'+(Store.cloudError?'<div style="color:#ffb6b6;margin-bottom:8px">Sync error: '+esc(Store.cloudError)+'</div>':'')+'<button id="tj-auth-open" style="padding:5px 9px">'+(Store.mode==='cloud'?'Account / migrate / sign out':'Sign in to sync')+'</button>';
+  bar.querySelector('button').onclick=showAuthDialog}
+function showAuthDialog(){document.getElementById('tj-auth-dialog')?.remove();const cover=document.createElement('div');cover.id='tj-auth-dialog';cover.style.cssText='position:fixed;inset:0;background:#000a;z-index:100000;display:grid;place-items:center;padding:15px';
+  cover.innerHTML='<div style="background:#172434;color:white;padding:24px;border-radius:14px;width:min(440px,95vw);font:14px system-ui"><h2 style="margin:0 0 12px">Supabase cloud sync</h2><p>'+esc(Store.mode==='cloud'?'Signed in as '+Store.session.user.email:'Sign in with your existing Supabase email/password account. Local data stays on this device until you explicitly migrate it.')+'</p><label>Public publishable key<input id="tj-key" autocomplete="off" style="display:block;width:100%;padding:9px;margin:5px 0 12px" value="'+esc(Store.key)+'"></label>'+
+  (Store.mode==='cloud'?'<button id="tj-migrate">Upload local data (confirm first)</button> <button id="tj-signout">Sign out</button>':'<label>Email<input id="tj-email" type="email" autocomplete="username" style="display:block;width:100%;padding:9px;margin:5px 0 12px"></label><label>Password<input id="tj-pass" type="password" autocomplete="current-password" style="display:block;width:100%;padding:9px;margin:5px 0 12px"></label><button id="tj-signin">Sign in</button>')+' <button id="tj-close">Close</button><p id="tj-auth-msg" role="alert" style="color:#ffb6b6"></p></div>';
+  document.body.appendChild(cover);cover.querySelector('#tj-close').onclick=()=>cover.remove();const msg=cover.querySelector('#tj-auth-msg');
+  const keyInput=cover.querySelector('#tj-key');keyInput.onchange=()=>{if(Store.mode==='cloud'){msg.textContent='Sign out before changing the key.';return}localStorage.setItem('tj_supabase_publishable_key',keyInput.value.trim())};
+  const signin=cover.querySelector('#tj-signin');if(signin)signin.onclick=async()=>{const key=keyInput.value.trim();if(!key){msg.textContent='Enter the Supabase publishable key';return}localStorage.setItem('tj_supabase_publishable_key',key);signin.disabled=true;try{const r=await fetch(SUPA_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{'apikey':key,'Content-Type':'application/json'},body:JSON.stringify({email:cover.querySelector('#tj-email').value.trim(),password:cover.querySelector('#tj-pass').value})});const j=await r.json();if(!r.ok)throw Error(j.error_description||j.msg||j.message||'Sign in failed');setSession(j);await loadAll();location.reload()}catch(e){msg.textContent=e.message;signin.disabled=false}};
+  const signout=cover.querySelector('#tj-signout');if(signout)signout.onclick=async()=>{if(!confirm('Sign out? The cloud journal will close and this device’s original local data will remain unchanged.'))return;try{await sbRequest('/auth/v1/logout',{method:'POST'})}catch(e){console.warn(e)}localStorage.removeItem('tj_supabase_session');Store.session=null;Store.uid=null;Store.mode='local';location.reload()};
+  const migrate=cover.querySelector('#tj-migrate');if(migrate)migrate.onclick=()=>migrateLocal()}
 /* downloads */
 async function saveFile(filename,data,mime){
   if(Store.downloads){
@@ -2465,7 +2441,7 @@ function renderTradesPage(){
     </section>
     <div id="trlist">${trListHtml(L)}</div>
     <section class="trsum" id="trsum">${trSummary(L)}</section>
-    <p class="note">${Store.mode==='cloud'?'Trades are saved to your Claude account.':'Trades are saved in this browser only. Export a JSON backup regularly.'}</p>
+    <p class="note">${Store.mode==='cloud'?'Trades sync to your Supabase account.':'Trades are saved in this browser only. Export a JSON backup regularly.'}</p>
   </div>`;
 }
 
@@ -2513,7 +2489,7 @@ function renderPlansHome(){
         <select class="field selp" data-ppst="1" aria-label="Status"><option value="">Status</option>${['Submitted','Draft','Missed'].map(o=>`<option${f.status===o?' selected':''}>${o}</option>`).join('')}</select>
         ${srchBox('data-ppq="1"',f.q)}</div>
       <div id="pplist">${ppList()}</div></section>
-    <p class="note">${Store.mode==='cloud'?'Plans save automatically to your Claude account as you type.':'Plans save automatically in this browser. Export a JSON backup regularly.'}</p></div>`;
+    <p class="note">${Store.mode==='cloud'?'Plans sync automatically to your Supabase account as you type.':'Plans save automatically in this browser. Export a JSON backup regularly.'}</p></div>`;
 }
 
 
@@ -2834,7 +2810,7 @@ function filtered(){
 }
 function renderHome(){
   return `<div class="home">${draftBanner()}${renderJournalDash()}${renderEntries()}
-    <p class="note">${Store.mode==='cloud'?'Trades are saved to your Claude account and follow you across devices.':'Trades are saved in this browser only. Export a JSON backup regularly.'}</p></div>`;
+    <p class="note">${Store.mode==='cloud'?'Trades sync to your Supabase account and follow you across devices.':'Trades are saved in this browser only. Export a JSON backup regularly.'}</p></div>`;
 }
 
 /* ---------- WIZARD ---------- */
@@ -3280,11 +3256,6 @@ function softUpdate(){
 let tdTimer=null;
 const stripV=o=>{const c=clone(o||{});delete c.visited;delete c.skipped;return JSON.stringify(c)};
 function scheduleTradeDraft(){if(S.view!=='wizard'||!S.draft)return;clearTimeout(tdTimer);tdTimer=setTimeout(saveTradeDraft,700)}
-async function writeKv(key,val){
-  if(Store.mode==='cloud'){const ref=userCol().doc(key);return val==null?ref.delete():ref.set(val)}
-  if(Store.mem){val==null?Store.mem.kv.delete(key):Store.mem.kv.set(key,val);return}
-  return IDB.req('kv','readwrite',s=>val==null?s.delete(key):s.put(val,key));
-}
 async function saveTradeDraft(){
   clearTimeout(tdTimer);if(S.view!=='wizard'||!S.draft)return;
   if(!S.editing&&!S.resumed&&stripV(S.draft)===stripV(S.original))return;
@@ -5491,8 +5462,8 @@ window.addEventListener('beforeunload',e=>{if(S.view==='wizard'){e.preventDefaul
     const hadLists=!!S.settings.tagLists;const tlv=S.settings.tagListsV||1;ensureTagLists(S.settings);if(!S.settings.cleanedV3){const rx=/^\s*(2|two)[\s-]*stage[\s-]*(cic|ciC|CiC)\s*$/i;for(const k of Object.keys(S.settings.custom||{}))if(Array.isArray(S.settings.custom[k]))S.settings.custom[k]=S.settings.custom[k].filter(v=>!rx.test(v));for(const k of Object.keys(S.settings.tagLists||{}))S.settings.tagLists[k]=S.settings.tagLists[k].filter(v=>!rx.test(v));S.settings.cleanedV3=true;await saveSettings().catch(()=>{})}if((!hadLists||tlv<3)&&settings)await saveSettings().catch(()=>{});
     if(!settings)await saveSettings().catch(()=>{});
   }catch(e){console.error('load failed',e);S.loadFailed=true;S.trades=S.trades||[];S.plans=S.plans||[];S.days=S.days||[];S.pages=S.pages||[];S.expenses=S.expenses||[];
-    if(!S.settings||!Array.isArray(S.settings.accounts))S.settings=defaultSettings();S.settings.due=S.settings.due||{...DUE_DEFAULT};try{ensureTagLists(S.settings);initOpt(S.settings)}catch(e2){}}
-  S.loading=false;render();
+    if(Store.mode==='cloud'){Store.cloudError='Cloud loading failed: '+(e.message||e);S.loadFailed=true;}if(!S.settings||!Array.isArray(S.settings.accounts))S.settings=defaultSettings();S.settings.due=S.settings.due||{...DUE_DEFAULT};try{ensureTagLists(S.settings);initOpt(S.settings)}catch(e2){}}
+  S.loading=false;render();if(Store.cloudError&&Store.mode==='cloud'){document.getElementById('app').innerHTML='<div style="padding:35px;max-width:650px;margin:auto"><h2>Cloud journal unavailable</h2><p>'+esc(Store.cloudError)+'</p><p>Nothing has been switched to local mode. Check your connection or Supabase configuration, then refresh.</p></div>';}showSyncStatus();if(Store.authError)toast(Store.authError);
 })();
 </script>
 </body>
